@@ -126,9 +126,13 @@ public final class WireSender {
      * carries the PoiCandidateIn wire shape verbatim; bounds echoes the
      * effective scan area. mapImageBase64 is the optional top-down sketch
      * (ADR-037 E4); null omits the field — pre-S4a cores would reject it.
+     * heightGrid is the optional height payload (ADR-043 W1.1), same rule: null
+     * omits the field, and a core that does not yet know it rejects the WHOLE
+     * scan, so the core-side wire model must ship BEFORE this plugin is deployed.
      */
     public static JsonObject worldScanResult(String correlationId, JsonArray candidates,
-                                             JsonObject bounds, String mapImageBase64) {
+                                             JsonObject bounds, String mapImageBase64,
+                                             JsonObject heightGrid) {
         JsonObject msg = envelope();
         msg.addProperty("correlation_id", correlationId);
         msg.add("candidates", candidates);
@@ -136,7 +140,38 @@ public final class WireSender {
         if (mapImageBase64 != null) {
             msg.addProperty("map_image", mapImageBase64);
         }
+        if (heightGrid != null) {
+            msg.add("height_grid", heightGrid);
+        }
         return msg;
+    }
+
+    /**
+     * height_grid sub-object (ADR-043 W1.3). Takes the geometry record rather
+     * than loose ints so width/height and origin_x/origin_z cannot be swapped at
+     * the call site; the wire field names stay here, in the class whose job is
+     * building wire messages.
+     *
+     * origin_x / origin_z are carried explicitly instead of being re-derived from
+     * bounds by every reader (deviation/precision in the planning phase, ratified
+     * by owner approval): sample positions are integer block coordinates while
+     * center - radius is a double, so each reader would have to reproduce this
+     * exact rounding. Same reason width/height are explicit.
+     *
+     * NOTE: samples are FENCEPOSTS at origin + i*sample_step — they do not tile
+     * map_image, whose pixels are cells over ceil(2*radius). The two rasters
+     * share an origin, not an extent.
+     */
+    public static JsonObject heightGrid(HeightGrid.Geometry geometry, String dataBase64) {
+        JsonObject grid = new JsonObject();
+        grid.addProperty("sample_step", geometry.step());
+        grid.addProperty("origin_x", geometry.originX());
+        grid.addProperty("origin_z", geometry.originZ());
+        grid.addProperty("width", geometry.width());
+        grid.addProperty("height", geometry.height());
+        grid.addProperty("sentinel", HeightGrid.SENTINEL);
+        grid.addProperty("data_base64", dataBase64);
+        return grid;
     }
 
     /**

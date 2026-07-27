@@ -51,6 +51,7 @@ public final class ControlBridgePlugin extends JavaPlugin {
 
         getServer().getPluginManager().registerEvents(
                 new GameEventListener(this, client, npcManager), this);
+        getServer().getPluginManager().registerEvents(new NavDebugListener(this, config), this);
 
         // Rebuild the id<->NPC index when Citizens signals its NPCs are loaded
         // (restart-safe; a fixed next-tick rebuild races Citizens' own load).

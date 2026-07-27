@@ -65,6 +65,9 @@ public final class CommandDispatcher {
 
     private void handle(String command, JsonObject msg) {
         switch (command) {
+            case "configure" -> npcManager.applyNavConfig(
+                    dbl(msg, "nav_range"),
+                    intVal(msg, "nav_stuck_retries"));
             case "spawn_npc" -> npcManager.spawn(
                     str(msg, "npc_id"), str(msg, "name"),
                     dbl(msg, "x"), dbl(msg, "y"), dbl(msg, "z"),
@@ -96,6 +99,7 @@ public final class CommandDispatcher {
             case "world_query" -> worldQueryHandler.handle(msg);
             case "world_scan" -> worldScanHandler.handle(msg);
             case "npc_emote" -> renderEmote(str(msg, "npc_id"), str(msg, "text"), str(msg, "audience"));
+            case "rename_npc" -> npcManager.renameNpc(str(msg, "npc_id"), str(msg, "name"));
             default -> {
                 plugin.getLogger().warning("Unknown command from controller: " + command);
                 // Loud toward core, not just the local log: python-declared but
@@ -182,6 +186,10 @@ public final class CommandDispatcher {
 
     private static double dbl(JsonObject o, String field) {
         return o.get(field).getAsDouble();
+    }
+
+    private static int intVal(JsonObject o, String field) {
+        return o.get(field).getAsInt();
     }
 
     /**

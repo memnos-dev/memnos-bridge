@@ -6,6 +6,7 @@ import net.citizensnpcs.api.CitizensAPI;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.bukkit.Chunk;
+import org.bukkit.HeightMap;
 import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.block.BlockState;
@@ -55,6 +56,15 @@ public final class WorldScanHandler {
 
     private static final double DEFAULT_RADIUS = 128.0;
     private static final int MAX_CANDIDATES = 500;
+
+    /** Column cap for the height grid. The core's WebSocket server runs at the
+     *  library default max_size of 1 MiB per frame (it passes no override), and the
+     *  same frame also carries the candidates and the map_image PNG. Budgeting
+     *  512 KiB of base64 for the grid: 512 KiB * 3/4 = 393216 raw bytes / 4 bytes
+     *  per column (two int16 planes) = 98304 columns, i.e. radius ~624 at step 4.
+     *  Beyond that the grid is dropped with a warning — the same degradation as a
+     *  failed sketch render, rather than an oversized frame that would close the
+     *  connection and lose the ENTIRE scan, POI candidates included. */
     private static final PlainTextComponentSerializer PLAIN =
             PlainTextComponentSerializer.plainText();
 
@@ -189,9 +199,20 @@ public final class WorldScanHandler {
         final int maxY = world.getMaxHeight();
         final int chunkCount = coords.size();
 
+        // Phase 4: height sampling (ADR-043). MUST run here — on the main thread,
+        // synchronously, before the async dispatch below. Two reasons, both binding:
+        // ChunkSnapshot exposes no typed heightmap, so the live World API is the only
+        // source and that is main-thread-only; and handle() releases every plugin chunk
+        // ticket in its finally the moment this method RETURNS, while the async block
+        // outlives it — sampling there would read unticketed, possibly unloaded chunks.
+        // The existing async work is safe only because ChunkSnapshots are immutable
+        // copies. A later getChunkAtAsync rebuild must re-prove this assumption.
+        final HeightSamples heights = sampleHeights(world, centerX, centerZ, radius);
+
         plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
             final JsonArray workstations = scanWorkstations(snapshots, minY, maxY);
             final String mapImage = renderSketch(snapshots, centerX, centerZ, radius, minY);
+            final JsonObject heightGrid = encodeHeights(heights);
             plugin.getServer().getScheduler().runTask(plugin, () -> {
                 for (JsonElement e : workstations) {
                     if (candidates.size() >= MAX_CANDIDATES) {
@@ -208,7 +229,8 @@ public final class WorldScanHandler {
                 bounds.addProperty("center_x", centerX);
                 bounds.addProperty("center_z", centerZ);
                 bounds.addProperty("radius", radius);
-                client.send(WireSender.worldScanResult(correlationId, candidates, bounds, mapImage));
+                client.send(WireSender.worldScanResult(
+                        correlationId, candidates, bounds, mapImage, heightGrid));
             });
         });
     }
@@ -449,6 +471,76 @@ public final class WorldScanHandler {
             return Base64.getEncoder().encodeToString(out.toByteArray());
         } catch (IOException | RuntimeException e) {
             plugin.getLogger().warning("world_scan sketch render failed; sending scan without map.");
+            return null;
+        }
+    }
+
+    /** Sampled height planes plus the geometry needed to describe them on the wire. */
+    private record HeightSamples(HeightGrid.Geometry geometry, short[] planes) {
+    }
+
+    /** Runs on the MAIN thread while the scan's chunk tickets are still held (see the
+     *  call site). Any failure logs a warning and returns null, exactly like
+     *  renderSketch: the scan must never die for an optional payload. */
+    private HeightSamples sampleHeights(World world, double centerX, double centerZ, double radius) {
+        try {
+            HeightGrid.Geometry geom =
+                    HeightGrid.geometry(centerX, centerZ, radius, HeightGrid.SAMPLE_STEP);
+            if (geom == null) {
+                plugin.getLogger().warning("world_scan: degenerate bounds (radius " + radius
+                        + "); sending scan without height grid.");
+                return null;
+            }
+
+            long startNanos = System.nanoTime();
+            short[] planes = HeightGrid.build(geom, new HeightGrid.ColumnSampler() {
+                @Override
+                public boolean available(int wx, int wz) {
+                    // >> 4, never / 16: division truncates toward zero and picks the
+                    // wrong chunk for negative coordinates.
+                    return world.isChunkLoaded(wx >> 4, wz >> 4);
+                }
+
+                @Override
+                public int surfaceY(int wx, int wz) {
+                    return world.getHighestBlockYAt(wx, wz, HeightMap.MOTION_BLOCKING_NO_LEAVES);
+                }
+
+                @Override
+                public int floorY(int wx, int wz) {
+                    return world.getHighestBlockYAt(wx, wz, HeightMap.OCEAN_FLOOR);
+                }
+            });
+            long millis = (System.nanoTime() - startNanos) / 1_000_000L;
+
+            // C: the live criterion for this slice. The sample box is provably inside the
+            // ticketed chunk box, so a non-zero sentinel share means a chunk failed to stay
+            // loaded — "no data", never bad geometry. Expected 0%.
+            int sentinels = HeightGrid.countSentinelColumns(planes);
+            int total = geom.cells();
+            plugin.getLogger().info("world_scan: height grid " + geom.width() + "x" + geom.height()
+                    + " step " + geom.step() + ", " + sentinels + "/" + total
+                    + " sentinel column(s) (" + (total == 0 ? 0 : (sentinels * 100L) / total)
+                    + "%), " + millis + " ms.");
+            return new HeightSamples(geom, planes);
+        } catch (RuntimeException e) {
+            plugin.getLogger().log(java.util.logging.Level.WARNING,
+                    "world_scan height sampling failed; sending scan without height grid.", e);
+            return null;
+        }
+    }
+
+    /** Runs OFF the main thread on the finished sample arrays (immutable from here on),
+     *  mirroring how renderSketch keeps encoding work off the tick. */
+    private JsonObject encodeHeights(HeightSamples samples) {
+        if (samples == null) {
+            return null; // sampling already logged why
+        }
+        try {
+            return WireSender.heightGrid(samples.geometry(), HeightGrid.encode(samples.planes()));
+        } catch (RuntimeException e) {
+            plugin.getLogger().log(java.util.logging.Level.WARNING,
+                    "world_scan height encoding failed; sending scan without height grid.", e);
             return null;
         }
     }

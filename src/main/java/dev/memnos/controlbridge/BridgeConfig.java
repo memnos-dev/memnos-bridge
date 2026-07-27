@@ -18,6 +18,7 @@ public final class BridgeConfig {
         this.reconnectDelaySeconds = reconnectDelaySeconds;
         this.proximityRadius = proximityRadius;
         this.debugWireLogging = debugWireLogging;
+
     }
 
     /** Read configuration from the plugin's config.yml. */
@@ -53,4 +54,5 @@ public final class BridgeConfig {
     public boolean hasControllerUrl() {
         return controllerUrl != null && !controllerUrl.isBlank();
     }
+
 }

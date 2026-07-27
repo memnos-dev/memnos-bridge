@@ -10,6 +10,9 @@ import org.bukkit.entity.EntityType;
 import org.bukkit.entity.Player;
 import org.bukkit.event.player.PlayerTeleportEvent;
 import org.bukkit.plugin.Plugin;
+import net.citizensnpcs.api.ai.NavigatorParameters;
+import net.citizensnpcs.api.astar.pathfinder.DoorExaminer;
+import net.citizensnpcs.api.astar.pathfinder.BlockExaminer;
 
 import java.util.*;
 
@@ -34,6 +37,15 @@ public final class NpcManager {
     private final Map<String, UUID> lastInteractor = new HashMap<>();
     // (npcId|playerUuid) currently inside radius — for outside→inside edge detection.
     private final Set<String> inside = new HashSet<>();
+    // Navigation settings, delivered by the core via the configure command
+    // after each handshake. Compiled fallbacks cover the window before the
+    // first configure arrives (NPCs are indexed BEFORE connect — the index
+    // gates the connection) and a core that never sends one.
+    // FALLBACK COUPLING: 160 must stay >= the core's default
+    // BEHAVIOR_PLACE_THRESHOLD_BLOCKS (150); the authoritative value is
+    // core-derived and re-applied on every configure.
+    private double navRange = 160.0;
+    private int navStuckRetries = 2;
 
     public record Approach(UUID playerUuid, String npcId, double distance) {}
 
@@ -41,6 +53,18 @@ public final class NpcManager {
         this.plugin = plugin;
         this.radius = radius;
         this.debugWireLogging = debugWireLogging;
+    }
+
+    /** Apply core-delivered navigation settings and re-apply the defaults to
+     *  every indexed NPC. Called on every configure (each (re)connect) —
+     *  idempotent. Main-thread only, like every other method here. */
+    public void applyNavConfig(double range, int stuckRetries) {
+        this.navRange = range;
+        this.navStuckRetries = stuckRetries;
+        for (NPC npc : index.values()) {
+            applyNavigationDefaults(npc);
+        }
+        plugin.getLogger().info("Nav config applied to " + index.size() + " NPC(s).");
     }
 
     /** Players who just crossed into an NPC's radius this scan. Pure-ish: mutates `inside`. */
@@ -73,6 +97,7 @@ public final class NpcManager {
         for (NPC npc : CitizensAPI.getNPCRegistry()) {
             IdentityTrait trait = npc.getTraitNullable(IdentityTrait.class);
             if (trait != null && trait.getNpcId() != null && !trait.getNpcId().isBlank()) {
+                applyNavigationDefaults(npc);
                 index.put(trait.getNpcId(), npc);
             }
         }
@@ -95,8 +120,43 @@ public final class NpcManager {
             npc.getOrAddTrait(SkinTrait.class).setSkinName(skinRef);
         }
         npc.spawn(new Location(world, x, y, z)); // coordinates are never logged
+        applyNavigationDefaults(npc);
         index.put(npcId, npc);
         plugin.getLogger().info("Spawned NPC " + npcId);
+    }
+
+    /** Navigation defaults, applied to every NPC under bridge control.
+     *  Deterministic override of whatever Citizens config or manual /npc pathopt
+     *  left behind — tenant-side Citizens configs are not under our control.
+     *  - range: core-delivered via configure (derived from the place threshold);
+     *    compiled fallback until the first configure arrives.
+     *  - useNewPathfinder(true): the Citizens A* pathfinder (pathfinder-type
+     *    CITIZENS) — the MINECRAFT navigator does not open doors reliably.
+     *  - stationaryTicks(60): explicit stuck detection (3s without progress),
+     *    independent of the tenant's Citizens config defaults.
+     *  - distanceMargin(2.0): arrival tolerance; prevents endless micro-
+     *    adjustment jitter at the target.
+     *  - DoorExaminer: walk through wooden doors/gates, opening them (iron
+     *    doors stay impassable by design — redstone territory). Idempotent:
+     *    examiners are a list and this method runs again on every
+     *    rebuildIndex AND every configure — without the guard each pass
+     *    appends a duplicate. */
+    private void applyNavigationDefaults(NPC npc) {
+        NavigatorParameters params = npc.getNavigator().getDefaultParameters();
+        params.range((float) navRange);
+        params.useNewPathfinder(true);
+        params.stationaryTicks(60);
+        params.distanceMargin(2.0);
+        boolean hasDoorExaminer = false;
+        for (BlockExaminer examiner : params.examiners()) {
+            if (examiner instanceof DoorExaminer) {
+                hasDoorExaminer = true;
+                break;
+            }
+        }
+        if (!hasDoorExaminer) {
+            params.examiner(new DoorExaminer());
+        }
     }
 
     /** Despawn and forget. Idempotent. */
@@ -190,9 +250,9 @@ public final class NpcManager {
         return Bukkit.getWorld(worldId);
     }
 
-    /** Move an NPC toward a target via Citizens pathfinding. Pure mechanism:
-     *  the plugin only forwards the target; Citizens computes the path. An
-     *  unreachable target makes the navigator give up (NPC stops) — no teleport. */
+    /** Move an NPC toward a target via Citizens pathfinding. The plugin owns
+     *  execution robustness (retry-then-teleport stuck escalation); the core
+     *  only decided WHAT (move vs place, threshold-gated core-side). */
     public void move(String npcId, double x, double y, double z, String worldId) {
         NPC npc = index.get(npcId);
         if (npc == null || !npc.isSpawned() || npc.getEntity() == null) {
@@ -205,6 +265,11 @@ public final class NpcManager {
             return;
         }
         npc.getNavigator().setTarget(new Location(world, x, y, z)); // coords never logged
+        // Per-navigation stuck escalation: fresh instance so the retry counter
+        // never leaks across navigations. Local parameters are this
+        // navigation's copy of the defaults.
+        npc.getNavigator().getLocalParameters()
+                .stuckAction(new RetryThenTeleportStuckAction(plugin, npcId, navStuckRetries));
         plugin.getLogger().info("Move dispatched for " + npcId);
     }
 
@@ -261,6 +326,20 @@ public final class NpcManager {
         }
         return Optional.of(new WorldQueryResult(minuteOfDay, nearby,
                 loc.getX(), loc.getY(), loc.getZ()));
+    }
+
+    /** Set the Citizens nameplate of an existing NPC in place, without
+     *  respawn. Idempotent. Unknown npc_id: log-and-ignore -- the next
+     *  connects reconcile heals via spawn_npc, which carries the name
+     *  */
+    public void renameNpc(String npcId, String name) {
+        NPC npc = index.get(npcId);
+        if (npc == null) {
+            plugin.getLogger().warning("Rename skipped for " + npcId + ": unknown NPC.");
+            return;
+        }
+        npc.setName(name);
+        plugin.getLogger().info("Renamed NPC " + npcId + " -> '" + name + "'");
     }
 
     /** Number of indexed NPCs; used for restart-visibility logging. */
