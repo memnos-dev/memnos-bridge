@@ -67,7 +67,9 @@ public final class CommandDispatcher {
         switch (command) {
             case "configure" -> npcManager.applyNavConfig(
                     dbl(msg, "nav_range"),
-                    intVal(msg, "nav_stuck_retries"));
+                    intVal(msg, "nav_stuck_retries"),
+                    msg.has("nav_authority") ? str(msg, "nav_authority") : "plugin"
+            );
             case "spawn_npc" -> npcManager.spawn(
                     str(msg, "npc_id"), str(msg, "name"),
                     dbl(msg, "x"), dbl(msg, "y"), dbl(msg, "z"),
@@ -89,6 +91,7 @@ public final class CommandDispatcher {
             }
             case "npc_move" -> npcManager.move(
                     str(msg, "npc_id"),
+                    str(msg, "msg_id"),
                     dbl(msg, "x"), dbl(msg, "y"), dbl(msg, "z"),
                     str(msg, "world_id"));
             case "npc_place" -> npcManager.place(

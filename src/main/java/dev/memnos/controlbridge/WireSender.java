@@ -228,4 +228,42 @@ public final class WireSender {
         msg.add("capabilities", caps);
         return msg;
     }
+
+    /** ADR-045 E1: leg arrival with the buffered 1 Hz trajectory (mode "core" only). */
+    public static JsonObject npcNavCompleted(String navId, String npcId,
+                                             String worldId, java.util.List<double[]> points) {
+        JsonObject msg = envelope();
+        msg.addProperty("event", "npc_nav_completed");
+        msg.addProperty("nav_id", navId);
+        msg.addProperty("npc_id", npcId);
+        JsonArray path = new JsonArray();
+        for (double[] p : points) {
+            JsonObject wp = new JsonObject();
+            wp.addProperty("world_id", worldId);
+            wp.addProperty("x", p[0]);
+            wp.addProperty("y", p[1]);
+            wp.addProperty("z", p[2]);
+            path.add(wp);
+        }
+        msg.add("path", path);
+        return msg;
+    }
+
+    /** ADR-045 E1/E2: stuck after local retries; navigation stops, core decides. */
+    public static JsonObject npcNavStuck(String navId, String npcId,
+                                         String worldId, double x, double y, double z,
+                                         int attempts) {
+        JsonObject msg = envelope();
+        msg.addProperty("event", "npc_nav_stuck");
+        msg.addProperty("nav_id", navId);
+        msg.addProperty("npc_id", npcId);
+        JsonObject pos = new JsonObject();
+        pos.addProperty("world_id", worldId);
+        pos.addProperty("x", x);
+        pos.addProperty("y", y);
+        pos.addProperty("z", z);
+        msg.add("position", pos);
+        msg.addProperty("attempts", attempts);
+        return msg;
+    }
 }

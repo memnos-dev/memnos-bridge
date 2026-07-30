@@ -47,6 +47,19 @@ public final class NpcManager {
     private double navRange = 160.0;
     private int navStuckRetries = 2;
 
+    // ADR-045 E2: compiled fallback mirrors the core default. Reporting exists
+// only when the core explicitly requests mode "core" via configure.
+    private String navAuthority = "plugin";
+
+    /** One controller-driven navigation being tracked (mode "core" only). */
+    record ActiveNav(String navId, String worldId, java.util.List<double[]> points) {}
+    private final Map<String, ActiveNav> activeNavs = new HashMap<>();
+    private static final int MAX_TRAJECTORY_POINTS = 1800; // 30 min @ 1 Hz
+
+    private BridgeClient client; // attached by the plugin after both exist
+    public void attachClient(BridgeClient client) { this.client = client; }
+    public boolean isCoreAuthority() { return "core".equals(navAuthority); }
+
     public record Approach(UUID playerUuid, String npcId, double distance) {}
 
     public NpcManager(Plugin plugin, double radius, boolean debugWireLogging) {
@@ -58,9 +71,14 @@ public final class NpcManager {
     /** Apply core-delivered navigation settings and re-apply the defaults to
      *  every indexed NPC. Called on every configure (each (re)connect) —
      *  idempotent. Main-thread only, like every other method here. */
-    public void applyNavConfig(double range, int stuckRetries) {
+    public void applyNavConfig(double range, int stuckRetries, String authority) {
         this.navRange = range;
         this.navStuckRetries = stuckRetries;
+        if (!authority.equals(this.navAuthority)) {
+            // Mode switch mid-flight: buffers from the old mode are meaningless.
+            activeNavs.clear();
+        }
+        this.navAuthority = authority;
         for (NPC npc : index.values()) {
             applyNavigationDefaults(npc);
         }
@@ -253,7 +271,7 @@ public final class NpcManager {
     /** Move an NPC toward a target via Citizens pathfinding. The plugin owns
      *  execution robustness (retry-then-teleport stuck escalation); the core
      *  only decided WHAT (move vs place, threshold-gated core-side). */
-    public void move(String npcId, double x, double y, double z, String worldId) {
+    public void move(String npcId, String navId, double x, double y, double z, String worldId) {
         NPC npc = index.get(npcId);
         if (npc == null || !npc.isSpawned() || npc.getEntity() == null) {
             plugin.getLogger().warning("Move skipped for " + npcId + ": not present.");
@@ -264,12 +282,22 @@ public final class NpcManager {
             plugin.getLogger().warning("Move skipped for " + npcId + ": world not found.");
             return;
         }
+        if (isCoreAuthority()) {
+            // Overwrite-first: a new move supersedes any tracked nav for this NPC.
+            // The superseded buffer is discarded, never sent (ADR-045 E3).
+            Location start = npc.getEntity().getLocation();
+            java.util.List<double[]> pts = new java.util.ArrayList<>();
+            pts.add(new double[]{start.getX(), start.getY(), start.getZ()});
+            activeNavs.put(npcId, new ActiveNav(navId, start.getWorld().getUID().toString(), pts));
+        } else {
+            activeNavs.remove(npcId);
+        }
         npc.getNavigator().setTarget(new Location(world, x, y, z)); // coords never logged
         // Per-navigation stuck escalation: fresh instance so the retry counter
         // never leaks across navigations. Local parameters are this
         // navigation's copy of the defaults.
         npc.getNavigator().getLocalParameters()
-                .stuckAction(new RetryThenTeleportStuckAction(plugin, npcId, navStuckRetries));
+                .stuckAction(new RetryThenTeleportStuckAction(plugin, npcId, navStuckRetries, this, client));
         plugin.getLogger().info("Move dispatched for " + npcId);
     }
 
@@ -351,5 +379,37 @@ public final class NpcManager {
      *  Main-thread only, like every other method here. */
     public Set<String> indexedNpcIds() {
         return Set.copyOf(index.keySet());
+    }
+
+    /** 1 Hz, main thread. Appends one sample per tracked nav. Coords are never logged. */
+    public void sampleActiveNavs() {
+        if (!isCoreAuthority() || activeNavs.isEmpty()) return;
+        var it = activeNavs.entrySet().iterator();
+        while (it.hasNext()) {
+            var e = it.next();
+            NPC npc = index.get(e.getKey());
+            if (npc == null || !npc.isSpawned() || npc.getEntity() == null) {
+                it.remove();
+                continue;
+            }
+            Location loc = npc.getEntity().getLocation();
+            e.getValue().points().add(new double[]{loc.getX(), loc.getY(), loc.getZ()});
+            if (e.getValue().points().size() > MAX_TRAJECTORY_POINTS) {
+                plugin.getLogger().warning("NAV trajectory buffer overflow; discarding npc=" + e.getKey());
+                it.remove(); // arrival will then send nothing — treated as never-terminated
+            }
+        }
+    }
+
+    public java.util.Optional<ActiveNav> takeNav(String npcId) {
+        return java.util.Optional.ofNullable(activeNavs.remove(npcId));
+    }
+
+    /** Reverse lookup Citizens-NPC -> memnos npc_id (index is tiny; linear is fine). */
+    public java.util.Optional<String> npcIdFor(NPC npc) {
+        for (var e : index.entrySet()) {
+            if (e.getValue().getId() == npc.getId()) return java.util.Optional.of(e.getKey());
+        }
+        return java.util.Optional.empty();
     }
 }

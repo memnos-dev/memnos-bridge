@@ -74,6 +74,8 @@ public final class ControlBridgePlugin extends JavaPlugin {
                                 + npcManager.indexSize() + " NPC(s).");
                     }
                 }, this);
+        npcManager.attachClient(client);
+        getServer().getPluginManager().registerEvents(new NavOutcomeListener(npcManager, client), this);
         // Citizens loads its NPCs during delayed init, AFTER our onEnable — so the
         // CitizensEnableEvent handler above drives the connect. Two exceptions need
         // catching here, or the bridge would never connect at all:
@@ -98,6 +100,7 @@ public final class ControlBridgePlugin extends JavaPlugin {
         // Reactive approach detection: poll once per second on the main thread
         // (Citizens/location reads are not thread-safe). Edge-triggered + radius-gated.
         getServer().getScheduler().runTaskTimer(this, () -> {
+            npcManager.sampleActiveNavs();
             for (NpcManager.Approach a : npcManager.scanApproaches()) {
                 client.send(WireSender.playerApproach(a.playerUuid(), a.npcId(), a.distance()));
             }
